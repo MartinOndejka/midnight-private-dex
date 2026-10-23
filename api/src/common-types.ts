@@ -1,99 +1,91 @@
-// This file is part of midnightntwrk/example-bboard.
-// Copyright (C) Midnight Foundation
+// Private order book DEX for Midnight.
 // SPDX-License-Identifier: Apache-2.0
-// Licensed under the Apache License, Version 2.0 (the "License");
-// You may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 
 /**
- * Bulletin board common types and abstractions.
+ * DEX common types and abstractions.
  *
  * @module
  */
 
 import { type MidnightProviders } from '@midnight-ntwrk/midnight-js-types';
 import { type FoundContract } from '@midnight-ntwrk/midnight-js-contracts';
-import type { State, BBoardPrivateState, Contract, Witnesses } from '../../contract/src/index';
+import type { PdexPrivateState, Contract, Witnesses, Side, PdexTokens } from '../../contract/src/index';
 
-export const bboardPrivateStateKey = 'bboardPrivateState';
-export type PrivateStateId = typeof bboardPrivateStateKey;
+export const pdexPrivateStateKey = 'pdexPrivateState';
+export type PrivateStateId = typeof pdexPrivateStateKey;
 
 /**
  * The private states consumed throughout the application.
- *
- * @remarks
- * {@link PrivateStates} can be thought of as a type that describes a schema for all
- * private states for all contracts used in the application. Each key represents
- * the type of private state consumed by a particular type of contract.
- * The key is used by the deployed contract when interacting with a private state provider,
- * and the type (i.e., `typeof PrivateStates[K]`) represents the type of private state
- * expected to be returned.
- *
- * Since there is only one contract type for the bulletin board example, we only define a
- * single key/type in the schema.
  *
  * @public
  */
 export type PrivateStates = {
   /**
-   * Key used to provide the private state for {@link BBoardContract} deployments.
+   * Key used to provide the private state for {@link PdexContract} deployments.
    */
-  readonly bboardPrivateState: BBoardPrivateState;
+  readonly pdexPrivateState: PdexPrivateState;
 };
 
 /**
- * Represents a bulletin board contract and its private state.
+ * Represents a DEX contract and its private state.
  *
  * @public
  */
-export type BBoardContract = Contract<BBoardPrivateState, Witnesses<BBoardPrivateState>>;
+export type PdexContract = Contract<PdexPrivateState, Witnesses<PdexPrivateState>>;
 
 /**
- * The keys of the circuits exported from {@link BBoardContract}.
+ * The keys of the circuits exported from {@link PdexContract}.
  *
  * @public
  */
-export type BBoardCircuitKeys = Exclude<keyof BBoardContract['impureCircuits'], number | symbol>;
+export type PdexCircuitKeys = Exclude<keyof PdexContract['impureCircuits'], number | symbol>;
 
 /**
- * The providers required by {@link BBoardContract}.
+ * The providers required by {@link PdexContract}.
  *
  * @public
  */
-export type BBoardProviders = MidnightProviders<BBoardCircuitKeys, PrivateStateId, BBoardPrivateState>;
+export type PdexProviders = MidnightProviders<PdexCircuitKeys, PrivateStateId, PdexPrivateState>;
 
 /**
- * A {@link BBoardContract} that has been deployed to the network.
+ * A {@link PdexContract} that has been deployed to the network.
  *
  * @public
  */
-export type DeployedBBoardContract = FoundContract<BBoardContract>;
+export type DeployedPdexContract = FoundContract<PdexContract>;
+
+/**
+ * One order on the book, as the current user sees it.
+ */
+export type OrderView = {
+  readonly id: bigint;
+  readonly side: Side;
+  /** QUOTE units for one BASE unit. */
+  readonly price: bigint;
+  readonly size: bigint;
+  readonly remaining: bigint;
+  /** Smallest fill in BASE units, except a fill of all of `remaining`. */
+  readonly minFill: bigint;
+  /** Proceeds that the maker did not claim yet (QUOTE for SELL, BASE for BUY). */
+  readonly unclaimed: bigint;
+
+  /**
+   * `true` if the secret key of the current user opens the owner commitment of this order.
+   *
+   * @remarks
+   * Only the maker can compute this. Other users see an opaque commitment that is different for
+   * each order.
+   */
+  readonly isMine: boolean;
+};
 
 /**
  * A type that represents the derived combination of public (or ledger), and private state.
  */
-export type BBoardDerivedState = {
-  readonly state: State;
-  readonly sequence: bigint;
-  readonly message: string | undefined;
-
-  /**
-   * A readonly flag that determines if the current message was posted by the current user.
-   *
-   * @remarks
-   * The `owner` property of the public (or ledger) state is the public key of the message owner, while
-   * the `secretKey` property of {@link BBoardPrivateState} is the secret key of the current user. If
-   * `owner` corresponds to the public key derived from `secretKey`, then `isOwner` is `true`.
-   */
-  readonly isOwner: boolean;
+export type PdexDerivedState = {
+  readonly tokens: PdexTokens;
+  /** SELL orders, lowest price first. */
+  readonly asks: readonly OrderView[];
+  /** BUY orders, highest price first. */
+  readonly bids: readonly OrderView[];
 };
-
-// TODO: for some reason I needed to include "@midnight-ntwrk/wallet-sdk-address-format": "1.0.0-rc.1", should we bump in to rc-2 ?

@@ -1,0 +1,254 @@
+// Private order book DEX for Midnight.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Model:
+//   - The book is lit: side, price and size of each order are public, so
+//     takers can discover prices.
+//   - Makers are anonymous: an order stores only an owner commitment
+//     hash(domain, contract, orderId, secretKey). The commitment is different
+//     for each order, so the book does not link two orders of one maker.
+//   - Assets are shielded coins. The contract mints a test pair (BASE, QUOTE)
+//     and holds the maker's coin in escrow until it is filled or cancelled.
+//   - Takers choose the order to fill. The taker's payment stays in the
+//     contract as proceeds of that order until the maker claims it.
+//
+// Price is an integer: QUOTE units for one BASE unit.
+//
+// Privacy limits (see README):
+//   - Coin info of escrow and proceeds is public, and the stdlib derives
+//     output nonces from it. A party who knows the coin public key of a user
+//     can match that key to the user's fills, claims, cancels and faucet
+//     mints. Use a coin key that you do not share.
+//   - Each fill changes the order, so a fill can make a pending claim or
+//     cancel of the same order fail. `minFill` limits how often this occurs.
+
+pragma language_version 0.23;
+
+import CompactStandardLibrary;
+
+export enum Side {
+  BUY,
+  SELL
+}
+
+export struct Order {
+  side: Side;
+  price: Uint<64>;
+  size: Uint<64>;
+  remaining: Uint<64>;
+  // Smallest fill, except a fill of all of `remaining`.
+  minFill: Uint<64>;
+  owner: Bytes<32>;
+}
+
+export ledger orders: Map<Uint<64>, Order>;
+// Coin that the maker gives for the order: BASE for SELL, QUOTE for BUY.
+export ledger escrow: Map<Uint<64>, QualifiedShieldedCoinInfo>;
+// Payments from takers that the maker did not claim yet.
+export ledger proceeds: Map<Uint<64>, QualifiedShieldedCoinInfo>;
+export ledger nextOrderId: Counter;
+export ledger mintNonce: Bytes<32>;
+export ledger mintCounter: Counter;
+
+witness localSecretKey(): Bytes<32>;
+
+constructor() {
+  nextOrderId.increment(1);
+  mintNonce = pad(32, "pdex:mint:nonce:");
+}
+
+// ---------------------------------------------------------------------------
+// Tokens
+
+circuit baseDomain(): Bytes<32> {
+  return pad(32, "pdex:token:base");
+}
+
+circuit quoteDomain(): Bytes<32> {
+  return pad(32, "pdex:token:quote");
+}
+
+circuit baseColor(): Bytes<32> {
+  return tokenType(baseDomain(), kernel.self());
+}
+
+circuit quoteColor(): Bytes<32> {
+  return tokenType(quoteDomain(), kernel.self());
+}
+
+circuit giveColor(side: Side): Bytes<32> {
+  return side == Side.SELL ? baseColor() : quoteColor();
+}
+
+circuit takeColor(side: Side): Bytes<32> {
+  return side == Side.SELL ? quoteColor() : baseColor();
+}
+
+// Test faucet: mint BASE or QUOTE to the caller.
+export circuit faucet(isBase: Boolean, amount: Uint<64>): ShieldedCoinInfo {
+  mintCounter.increment(1);
+  mintNonce = evolveNonce(mintCounter.read() as Uint<128>, mintNonce);
+  const domain = disclose(isBase) ? baseDomain() : quoteDomain();
+  return mintShieldedToken(
+    domain,
+    disclose(amount),
+    mintNonce,
+    left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey())
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Ownership
+
+// `dex` is the address of this DEX, so one key gives different
+// commitments in different deployments.
+export pure circuit ownerCommitment(dex: Bytes<32>, orderId: Uint<64>, sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<4, Bytes<32>>>(
+    [pad(32, "pdex:owner:"), dex, (orderId as Field) as Bytes<32>, sk]
+  );
+}
+
+circuit myCommitment(orderId: Uint<64>): Bytes<32> {
+  return ownerCommitment(kernel.self().bytes, orderId, localSecretKey());
+}
+
+circuit assertOwner(orderId: Uint<64>, order: Order): [] {
+  assert(
+    disclose(myCommitment(orderId) == order.owner),
+    "Not the order owner"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Orders
+
+// Amount of the escrow coin for an order of `size` BASE at `price`.
+pure circuit giveAmount(side: Side, price: Uint<64>, size: Uint<64>): Uint<128> {
+  return side == Side.SELL ? size as Uint<128> : (size * price) as Uint<128>;
+}
+
+// Place a limit order. `coin` is the escrow: exactly `size` BASE for SELL, or
+// exactly `size * price` QUOTE for BUY. Takers must fill at least `minFill`
+// BASE, or all that remains. Returns the order id.
+export circuit placeOrder(
+  side: Side,
+  price: Uint<64>,
+  size: Uint<64>,
+  minFill: Uint<64>,
+  coin: ShieldedCoinInfo
+): Uint<64> {
+  const s = disclose(side);
+  const p = disclose(price);
+  const n = disclose(size);
+  const m = disclose(minFill);
+  const c = disclose(coin);
+  assert(p > 0, "Price must be positive");
+  assert(n > 0, "Size must be positive");
+  assert(m > 0 && m <= n, "Min fill must be from 1 to size");
+  assert(c.color == giveColor(s), "Wrong escrow token");
+  assert(c.value == giveAmount(s, p, n), "Wrong escrow amount");
+
+  const id = nextOrderId.read();
+  nextOrderId.increment(1);
+
+  receiveShielded(c);
+  escrow.insertCoin(id, c, right<ZswapCoinPublicKey, ContractAddress>(kernel.self()));
+  orders.insert(id, Order {
+    side: s,
+    price: p,
+    size: n,
+    remaining: n,
+    minFill: m,
+    owner: disclose(myCommitment(id))
+  });
+  return id;
+}
+
+// Fill `amount` BASE of an order. `payment` is exactly what the maker wants:
+// `amount * price` QUOTE for a SELL order, or `amount` BASE for a BUY order.
+// The taker gets the matching part of the escrow.
+export circuit fillOrder(orderId: Uint<64>, amount: Uint<64>, payment: ShieldedCoinInfo): [] {
+  const id = disclose(orderId);
+  const n = disclose(amount);
+  const pay = disclose(payment);
+  assert(orders.member(id), "No such order");
+  const order = orders.lookup(id);
+  assert(n > 0, "Amount must be positive");
+  assert(n <= order.remaining, "Amount is more than remaining");
+  assert(n >= order.minFill || n == order.remaining, "Amount is less than min fill");
+
+  const quoteAmount = (n * order.price) as Uint<128>;
+  const takerPays = order.side == Side.SELL ? quoteAmount : n as Uint<128>;
+  const takerGets = order.side == Side.SELL ? n as Uint<128> : quoteAmount;
+  assert(pay.color == takeColor(order.side), "Wrong payment token");
+  assert(pay.value == takerPays, "Wrong payment amount");
+
+  // Payment goes to the order's proceeds.
+  receiveShielded(pay);
+  const self = right<ZswapCoinPublicKey, ContractAddress>(kernel.self());
+  if (proceeds.member(id)) {
+    proceeds.insertCoin(id, mergeCoinImmediate(proceeds.lookup(id), pay), self);
+  } else {
+    proceeds.insertCoin(id, pay, self);
+  }
+
+  // Escrow goes to the taker.
+  const sent = sendShielded(
+    escrow.lookup(id),
+    left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey()),
+    takerGets
+  );
+  if (sent.change.is_some) {
+    escrow.insertCoin(id, sent.change.value, self);
+  } else {
+    escrow.remove(id);
+  }
+
+  orders.insert(id, Order {
+    side: order.side,
+    price: order.price,
+    size: order.size,
+    remaining: (order.remaining - n) as Uint<64>,
+    minFill: order.minFill,
+    owner: order.owner
+  });
+}
+
+// Maker takes the proceeds of an order. When the order is fully filled, this
+// also removes it from the book.
+export circuit claim(orderId: Uint<64>): [] {
+  const id = disclose(orderId);
+  assert(orders.member(id), "No such order");
+  const order = orders.lookup(id);
+  assertOwner(id, order);
+  assert(proceeds.member(id), "Nothing to claim");
+
+  const coin = proceeds.lookup(id);
+  sendShielded(coin, left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey()), coin.value);
+  proceeds.remove(id);
+  if (order.remaining == 0) {
+    orders.remove(id);
+  }
+}
+
+// Maker cancels an order. Returns the escrow that is not filled and all
+// proceeds, then removes the order.
+export circuit cancelOrder(orderId: Uint<64>): [] {
+  const id = disclose(orderId);
+  assert(orders.member(id), "No such order");
+  const order = orders.lookup(id);
+  assertOwner(id, order);
+
+  const me = left<ZswapCoinPublicKey, ContractAddress>(ownPublicKey());
+  if (escrow.member(id)) {
+    const coin = escrow.lookup(id);
+    sendShielded(coin, me, coin.value);
+    escrow.remove(id);
+  }
+  if (proceeds.member(id)) {
+    const coin = proceeds.lookup(id);
+    sendShielded(coin, me, coin.value);
+    proceeds.remove(id);
+  }
+  orders.remove(id);
+}

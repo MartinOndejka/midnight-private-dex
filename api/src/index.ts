@@ -1,118 +1,110 @@
-// This file is part of midnightntwrk/example-bboard.
-// Copyright (C) Midnight Foundation
+// Private order book DEX for Midnight.
 // SPDX-License-Identifier: Apache-2.0
-// Licensed under the Apache License, Version 2.0 (the "License");
-// You may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 
 /**
- * Provides types and utilities for working with bulletin board contracts.
+ * Provides types and utilities for working with the private order book DEX contract.
  *
  * @packageDocumentation
  */
 
-import * as BBoard from '../../contract/src/managed/bboard/contract/index.js';
+import * as Pdex from '../../contract/src/managed/pdex/contract/index.js';
 
-import { type ContractAddress, convertFieldToBytes } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
+import { type ContractAddress, encodeContractAddress } from '@midnight-ntwrk/midnight-js-protocol/compact-runtime';
 import { type Logger } from 'pino';
 import {
-  type BBoardDerivedState,
-  type BBoardContract,
-  type BBoardProviders,
-  type DeployedBBoardContract,
-  bboardPrivateStateKey,
+  type OrderView,
+  type PdexDerivedState,
+  type PdexContract,
+  type PdexProviders,
+  type DeployedPdexContract,
+  pdexPrivateStateKey,
 } from './common-types.js';
-import { CompiledBBoardContractContract } from '../../contract/src/index';
+import { CompiledPdexContract, pdexTokenColors, pdexTokens, type PdexTokens } from '../../contract/src/index';
 import * as utils from './utils/index.js';
 import { deployContract, findDeployedContract } from '@midnight-ntwrk/midnight-js-contracts';
-import { combineLatest, map, tap, from, type Observable } from 'rxjs';
+import { combineLatest, map, from, type Observable } from 'rxjs';
 import { toHex } from '@midnight-ntwrk/midnight-js-utils';
-import { BBoardPrivateState, createBBoardPrivateState } from '../../contract/src/witnesses.js';
+import { type PdexPrivateState, createPdexPrivateState } from '../../contract/src/witnesses.js';
 
-/** @internal */
+export { Side } from '../../contract/src/managed/pdex/contract/index.js';
+export type { PdexTokens } from '../../contract/src/index';
 
 /**
- * An API for a deployed bulletin board.
+ * An API for a deployed DEX.
  */
-export interface DeployedBBoardAPI {
+export interface DeployedPdexAPI {
   readonly deployedContractAddress: ContractAddress;
-  readonly state$: Observable<BBoardDerivedState>;
+  readonly tokens: PdexTokens;
+  readonly state$: Observable<PdexDerivedState>;
 
-  post: (message: string) => Promise<void>;
-  takeDown: () => Promise<void>;
+  faucet: (token: 'base' | 'quote', amount: bigint) => Promise<void>;
+  placeOrder: (side: Pdex.Side, price: bigint, size: bigint, minFill?: bigint) => Promise<bigint>;
+  fillOrder: (orderId: bigint, amount: bigint) => Promise<void>;
+  claim: (orderId: bigint) => Promise<void>;
+  cancelOrder: (orderId: bigint) => Promise<void>;
 }
 
 /**
- * Provides an implementation of {@link DeployedBBoardAPI} by adapting a deployed bulletin board
- * contract.
+ * Derives the order book that the current user sees from the ledger state and the user's secret key.
+ */
+export const deriveState = (
+  contractAddress: ContractAddress,
+  ledgerState: Pdex.Ledger,
+  secretKey: Uint8Array,
+  tokens: PdexTokens,
+): PdexDerivedState => {
+  const dex = encodeContractAddress(contractAddress);
+  const orders: OrderView[] = [];
+  for (const [id, order] of ledgerState.orders) {
+    orders.push({
+      id,
+      side: order.side,
+      price: order.price,
+      size: order.size,
+      remaining: order.remaining,
+      minFill: order.minFill,
+      unclaimed: ledgerState.proceeds.member(id) ? ledgerState.proceeds.lookup(id).value : 0n,
+      isMine: toHex(Pdex.pureCircuits.ownerCommitment(dex, id, secretKey)) === toHex(order.owner),
+    });
+  }
+  const byPrice = (a: OrderView, b: OrderView) => (a.price < b.price ? -1 : a.price > b.price ? 1 : 0);
+  const open = (o: OrderView) => o.remaining > 0n;
+  return {
+    tokens,
+    asks: orders.filter((o) => o.side === Pdex.Side.SELL && (open(o) || o.isMine)).sort(byPrice),
+    bids: orders.filter((o) => o.side === Pdex.Side.BUY && (open(o) || o.isMine)).sort((a, b) => byPrice(b, a)),
+  };
+};
+
+/**
+ * Provides an implementation of {@link DeployedPdexAPI} by adapting a deployed DEX contract.
  *
  * @remarks
- * The `BBoardPrivateState` is managed at the DApp level by a private state provider. As such, this
- * private state is shared between all instances of {@link BBoardAPI}, and their underlying deployed
- * contracts. The private state defines a `'secretKey'` property that effectively identifies the current
- * user, and is used to determine if the current user is the owner of the message as the observable
- * contract state changes.
- *
- * In the future, Midnight.js will provide a private state provider that supports private state storage
- * keyed by contract address. This will remove the current workaround of sharing private state across
- * the deployed bulletin board contracts, and allows for a unique secret key to be generated for each bulletin
- * board that the user interacts with.
+ * The `PdexPrivateState` is managed at the DApp level by a private state provider. It holds a
+ * `'secretKey'` that the contract hashes with each order id into an owner commitment. The secret key
+ * never leaves the user's machine; only the commitment is on the ledger.
  */
-// TODO: Update BBoardAPI to use contract level private state storage.
-export class BBoardAPI implements DeployedBBoardAPI {
+export class PdexAPI implements DeployedPdexAPI {
   /** @internal */
   private constructor(
-    public readonly deployedContract: DeployedBBoardContract,
-    providers: BBoardProviders,
+    public readonly deployedContract: DeployedPdexContract,
+    private readonly providers: PdexProviders,
     private readonly logger?: Logger,
   ) {
     this.deployedContractAddress = deployedContract.deployTxData.public.contractAddress;
+    this.tokens = pdexTokens(this.deployedContractAddress);
+    this.colors = pdexTokenColors(this.deployedContractAddress);
     providers.privateStateProvider.setContractAddress(this.deployedContractAddress);
     this.state$ = combineLatest(
       [
-        // Combine public (ledger) state with...
-        providers.publicDataProvider.contractStateObservable(this.deployedContractAddress, { type: 'latest' }).pipe(
-          map((contractState) => BBoard.ledger(contractState.data)),
-          tap((ledgerState) =>
-            logger?.trace({
-              ledgerStateChanged: {
-                ledgerState: {
-                  ...ledgerState,
-                  state: ledgerState.state === BBoard.State.OCCUPIED ? 'occupied' : 'vacant',
-                  owner: toHex(ledgerState.owner),
-                },
-              },
-            }),
-          ),
-        ),
-        // ...private state...
-        //    since the private state of the bulletin board application never changes, we can query the
-        //    private state once and always use the same value with `combineLatest`. In applications
-        //    where the private state is expected to change, we would need to make this an `Observable`.
-        from(providers.privateStateProvider.get(bboardPrivateStateKey) as Promise<BBoardPrivateState>),
+        providers.publicDataProvider
+          .contractStateObservable(this.deployedContractAddress, { type: 'latest' })
+          .pipe(map((contractState) => Pdex.ledger(contractState.data))),
+        // The private state of the DEX never changes, so we query it once.
+        from(providers.privateStateProvider.get(pdexPrivateStateKey) as Promise<PdexPrivateState>),
       ],
-      // ...and combine them to produce the required derived state.
-      (ledgerState, privateState) => {
-        const hashedSecretKey = BBoard.pureCircuits.publicKey(
-          privateState.secretKey,
-          convertFieldToBytes(32, ledgerState.sequence, 'api/src/index.ts'),
-        );
-
-        return {
-          state: ledgerState.state,
-          message: ledgerState.message.value,
-          sequence: ledgerState.sequence,
-          isOwner: toHex(ledgerState.owner) === toHex(hashedSecretKey),
-        };
-      },
+      (ledgerState, privateState) =>
+        deriveState(this.deployedContractAddress, ledgerState, privateState.secretKey, this.tokens),
     );
   }
 
@@ -122,120 +114,163 @@ export class BBoardAPI implements DeployedBBoardAPI {
   readonly deployedContractAddress: ContractAddress;
 
   /**
-   * Gets an observable stream of state changes based on the current public (ledger),
-   * and private state data.
+   * Gets the token types of the BASE / QUOTE pair that this DEX mints and trades.
    */
-  readonly state$: Observable<BBoardDerivedState>;
+  readonly tokens: PdexTokens;
+
+  private readonly colors: { base: Uint8Array; quote: Uint8Array };
 
   /**
-   * Attempts to post a given message to the bulletin board.
-   *
-   * @param message The message to post.
-   *
-   * @remarks
-   * This method can fail during local circuit execution if the bulletin board is currently occupied.
+   * Gets an observable stream of the order book, as the current user sees it.
    */
-  async post(message: string): Promise<void> {
-    this.logger?.info(`postingMessage: ${message}`);
+  readonly state$: Observable<PdexDerivedState>;
 
-    const txData = await this.deployedContract.callTx.post(message);
+  /**
+   * Makes a new shielded coin description for a circuit argument. The wallet funds it from the user's
+   * own coins when it balances the transaction.
+   */
+  private coin(token: 'base' | 'quote', value: bigint) {
+    return { nonce: utils.randomBytes(32), color: this.colors[token], value };
+  }
 
+  private trace(circuit: string, txData: { public: { txHash: string; blockHeight: number } }) {
     this.logger?.trace({
-      transactionAdded: {
-        circuit: 'post',
-        txHash: txData.public.txHash,
-        blockHeight: txData.public.blockHeight,
-      },
+      transactionAdded: { circuit, txHash: txData.public.txHash, blockHeight: txData.public.blockHeight },
     });
   }
 
   /**
-   * Attempts to take down any currently posted message on the bulletin board.
-   *
-   * @remarks
-   * This method can fail during local circuit execution if the bulletin board is currently vacant,
-   * or if the currently posted message isn't owned by the owner computed from the current private
-   * state.
+   * Mints test tokens to the user's shielded wallet.
    */
-  async takeDown(): Promise<void> {
-    this.logger?.info('takingDownMessage');
-
-    const txData = await this.deployedContract.callTx.takeDown();
-
-    this.logger?.trace({
-      transactionAdded: {
-        circuit: 'takeDown',
-        txHash: txData.public.txHash,
-        blockHeight: txData.public.blockHeight,
-      },
-    });
+  async faucet(token: 'base' | 'quote', amount: bigint): Promise<void> {
+    this.logger?.info({ faucet: { token, amount } });
+    this.trace('faucet', await this.deployedContract.callTx.faucet(token === 'base', amount));
   }
 
   /**
-   * Deploys a new bulletin board contract to the network.
+   * Places a limit order and locks its escrow in the contract.
    *
-   * @param providers The bulletin board providers.
+   * @param side BUY or SELL BASE.
+   * @param price QUOTE units for one BASE unit.
+   * @param size BASE units.
+   * @param minFill Smallest fill in BASE units, except a fill of all that remains. A larger value makes it
+   * harder for takers to block a cancel with many small fills.
+   * @returns The id of the new order.
+   */
+  async placeOrder(side: Pdex.Side, price: bigint, size: bigint, minFill = 1n): Promise<bigint> {
+    this.logger?.info({ placeOrder: { side: Pdex.Side[side], price, size, minFill } });
+    const escrow = side === Pdex.Side.SELL ? this.coin('base', size) : this.coin('quote', size * price);
+    const txData = await this.deployedContract.callTx.placeOrder(side, price, size, minFill, escrow);
+    this.trace('placeOrder', txData);
+    return txData.private.result;
+  }
+
+  /**
+   * Fills `amount` BASE units of an order on the book.
+   *
+   * @remarks
+   * This method reads the order price from the latest ledger state. It can fail during local circuit
+   * execution if the order is gone, or if `amount` is more than the remaining size.
+   */
+  async fillOrder(orderId: bigint, amount: bigint): Promise<void> {
+    const order = await this.readOrder(orderId);
+    this.logger?.info({ fillOrder: { orderId, amount, side: Pdex.Side[order.side], price: order.price } });
+    const payment =
+      order.side === Pdex.Side.SELL ? this.coin('quote', amount * order.price) : this.coin('base', amount);
+    this.trace('fillOrder', await this.deployedContract.callTx.fillOrder(orderId, amount, payment));
+  }
+
+  /**
+   * Sends the unclaimed proceeds of one of the user's orders to the user's wallet.
+   */
+  async claim(orderId: bigint): Promise<void> {
+    this.logger?.info({ claim: { orderId } });
+    this.trace('claim', await this.deployedContract.callTx.claim(orderId));
+  }
+
+  /**
+   * Cancels one of the user's orders. The remaining escrow and the unclaimed proceeds go back to the
+   * user's wallet.
+   */
+  async cancelOrder(orderId: bigint): Promise<void> {
+    this.logger?.info({ cancelOrder: { orderId } });
+    this.trace('cancelOrder', await this.deployedContract.callTx.cancelOrder(orderId));
+  }
+
+  private async readOrder(orderId: bigint): Promise<Pdex.Order> {
+    const contractState = await this.providers.publicDataProvider.queryContractState(this.deployedContractAddress);
+    const ledgerState = contractState ? Pdex.ledger(contractState.data) : undefined;
+    if (!ledgerState?.orders.member(orderId)) {
+      throw new Error(`Order ${orderId} is not on the book`);
+    }
+    return ledgerState.orders.lookup(orderId);
+  }
+
+  /**
+   * Deploys a new DEX contract to the network.
+   *
+   * @param providers The DEX providers.
    * @param logger An optional 'pino' logger to use for logging.
-   * @returns A `Promise` that resolves with a {@link BBoardAPI} instance that manages the newly deployed
-   * {@link DeployedBBoardContract}; or rejects with a deployment error.
+   * @returns A `Promise` that resolves with a {@link PdexAPI} instance that manages the newly deployed
+   * {@link DeployedPdexContract}; or rejects with a deployment error.
    */
-  static async deploy(providers: BBoardProviders, logger?: Logger): Promise<BBoardAPI> {
+  static async deploy(providers: PdexProviders, logger?: Logger): Promise<PdexAPI> {
     logger?.info('deployContract');
 
-    const deployedBBoardContract = await deployContract(providers, {
-      compiledContract: CompiledBBoardContractContract,
-      privateStateId: bboardPrivateStateKey,
-      initialPrivateState: createBBoardPrivateState(utils.randomBytes(32)),
+    const deployedPdexContract = await deployContract(providers, {
+      compiledContract: CompiledPdexContract,
+      privateStateId: pdexPrivateStateKey,
+      initialPrivateState: createPdexPrivateState(utils.randomBytes(32)),
     });
 
     logger?.trace({
       contractDeployed: {
-        finalizedDeployTxData: deployedBBoardContract.deployTxData.public,
+        finalizedDeployTxData: deployedPdexContract.deployTxData.public,
       },
     });
 
-    return new BBoardAPI(deployedBBoardContract, providers, logger);
+    return new PdexAPI(deployedPdexContract, providers, logger);
   }
 
   /**
-   * Finds an already deployed bulletin board contract on the network, and joins it.
+   * Finds an already deployed DEX contract on the network, and joins it.
    *
-   * @param providers The bulletin board providers.
-   * @param contractAddress The contract address of the deployed bulletin board contract to search for and join.
+   * @param providers The DEX providers.
+   * @param contractAddress The contract address of the deployed DEX contract to search for and join.
    * @param logger An optional 'pino' logger to use for logging.
-   * @returns A `Promise` that resolves with a {@link BBoardAPI} instance that manages the joined
-   * {@link DeployedBBoardContract}; or rejects with an error.
+   * @returns A `Promise` that resolves with a {@link PdexAPI} instance that manages the joined
+   * {@link DeployedPdexContract}; or rejects with an error.
    */
-  static async join(providers: BBoardProviders, contractAddress: ContractAddress, logger?: Logger): Promise<BBoardAPI> {
+  static async join(providers: PdexProviders, contractAddress: ContractAddress, logger?: Logger): Promise<PdexAPI> {
     logger?.info({
       joinContract: {
         contractAddress,
       },
     });
 
-    const deployedBBoardContract = await findDeployedContract<BBoardContract>(providers, {
+    const deployedPdexContract = await findDeployedContract<PdexContract>(providers, {
       contractAddress,
-      compiledContract: CompiledBBoardContractContract,
-      privateStateId: bboardPrivateStateKey,
-      initialPrivateState: await BBoardAPI.getPrivateState(providers, contractAddress),
+      compiledContract: CompiledPdexContract,
+      privateStateId: pdexPrivateStateKey,
+      initialPrivateState: await PdexAPI.getPrivateState(providers, contractAddress),
     });
 
     logger?.trace({
       contractJoined: {
-        finalizedDeployTxData: deployedBBoardContract.deployTxData.public,
+        finalizedDeployTxData: deployedPdexContract.deployTxData.public,
       },
     });
 
-    return new BBoardAPI(deployedBBoardContract, providers, logger);
+    return new PdexAPI(deployedPdexContract, providers, logger);
   }
 
   private static async getPrivateState(
-    providers: BBoardProviders,
+    providers: PdexProviders,
     contractAddress: ContractAddress,
-  ): Promise<BBoardPrivateState> {
+  ): Promise<PdexPrivateState> {
     providers.privateStateProvider.setContractAddress(contractAddress);
-    const existingPrivateState = await providers.privateStateProvider.get(bboardPrivateStateKey);
-    return existingPrivateState ?? createBBoardPrivateState(utils.randomBytes(32));
+    const existingPrivateState = await providers.privateStateProvider.get(pdexPrivateStateKey);
+    return existingPrivateState ?? createPdexPrivateState(utils.randomBytes(32));
   }
 }
 
